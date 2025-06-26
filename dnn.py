@@ -1,16 +1,18 @@
 import os
 import cupy as cp
-
+import pickle
+import cv2
+import numpy as np
 
 class dnn_model:
 
-    def __init__(self,layer_dims,lr=10e-4):
+    def __init__(self,layer_dims,lr=10e-4,lambd=0.01):
         
         self.lr = lr
         self.layer_dims = layer_dims
         self.parameters = self.init_parameters(layer_dims)
         self.LOG_EPSILON = 10e-10
-
+        self.lambd = lambd
     def init_parameters(self,layer_dims):
         
         parameters = {} 
@@ -80,10 +82,16 @@ class dnn_model:
     
     def compute_loss(self,Y,AL):#
         AL = cp.clip(AL,self.LOG_EPSILON,1-self.LOG_EPSILON)# 0 logaritma olmasın diye clip yapıyoruz
-        loss = -cp.mean(Y * cp.log(AL) + (1 - Y) * cp.log(1 - AL))
+        cross_entropy = -cp.mean(Y * cp.log(AL) + (1 - Y) * cp.log(1 - AL))
 
+        if self.lambd > 0:
+            L2_sum = sum(cp.sum(cp.square(self.parameters['W'+str(l)])) for l in range(1, len(self.layer_dims)))
+            L2_term = (self.lambd / (2 * Y.shape[1])) * L2_sum
+            loss = cross_entropy + L2_term
+        else:
+            loss = cross_entropy
 
-        loss = cp.squeeze(loss)
+        loss = cp.squeeze(cross_entropy)
 
         return loss
     
@@ -104,7 +112,7 @@ class dnn_model:
         
         A_prev, W, b = cache
         m = A_prev.shape[1]  # batch size
-        dW = cp.dot(dZ, A_prev.T) / m            # shape: (n_l, n_l-1)
+        dW = (cp.dot(dZ, A_prev.T) / m) + (self.lambd / m) * W          # shape: (n_l, n_l-1)
         db = cp.sum(dZ, axis=1, keepdims=True) / m
         dA_prev = cp.dot(W.T,dZ)
 
@@ -179,14 +187,22 @@ class dnn_model:
     def learning_rate_decay(self,epoch,initial_learning_rate,decay_rate):
         return initial_learning_rate / (1 + decay_rate * epoch)
     
-    def train(self,X,Y,epochs,batch_size):
-        costs = []
+    def get_val_acc(self,x_val,y_val):
+        preds = self.predict(x_val)
+        acc = cp.sum(preds==y_val) /x_val.shape[1]
+
+        return acc
+
+
+    def train(self,X,Y,X_val,Y_val,epochs,batch_size):
+        logs = []
+        best_parameters = None
+        best_parameters_loss = 9999999
         for epoch in range(epochs):
-            self.lr = self.learning_rate_decay(epoch,self.lr,decay_rate=0.0001)
-            print(f"LR:{self.lr}")
+            self.lr = self.learning_rate_decay(epoch,self.lr,decay_rate=0.0003)
             mini_batches = self.get_mini_batches(X,Y,batch_size)
             print(f"Epoch:{epoch+1}")
-            cost = 0
+            loss = 0
             for batch in mini_batches:
 
                 batch_X,batch_Y = batch
@@ -197,15 +213,185 @@ class dnn_model:
 
                 self.update_parameters(grads)
 
-                batch_cost = self.compute_loss(batch_Y,AL)
-                cost += batch_cost
+                batch_loss = self.compute_loss(batch_Y,AL)
+                loss += batch_loss
                 
-            avg_cost = cost / len(mini_batches)
-            costs.append(avg_cost)
-            print(f"Loss:{avg_cost}")
-        return costs
+            avg_loss = loss / len(mini_batches)
+            val_acc = self.get_val_acc(X_val,Y_val)
+            val_loss = self.compute_loss(Y_val,self.predict(X_val))
+
+           
+            log = (avg_loss,val_loss,val_acc)
+            if val_loss < best_parameters_loss:
+                best_parameters = self.parameters
+                best_parameters_log = log
+                best_parameters_loss = val_loss
+
+            logs.append(log)
+            print(f"Loss:{avg_loss} Val loss:{val_loss} Val acc:{val_acc}")
+            
+        print("Saving Model..")
+        self.save_model(best_parameters)
+        return logs,best_parameters_log,best_parameters
     
     def predict(self,X,threshold=0.5):
         A,_ = self.forward_prop(X)
         return (A > threshold)
     
+    def predict_no_threshold(self,X):
+        A,_ = self.forward_prop(X)
+        return A
+    
+    def save_model(self, parameters):
+        # Cupy -> NumPy
+        cpu_params = { k: cp.asnumpy(v) for k, v in parameters.items() }
+        with open('parameters_best.pickle', 'wb') as handle:
+            pickle.dump(cpu_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def save_model(self,parameters):
+        """
+        Parametreleri önce CPU’ya (NumPy) çevirir,
+        sonra sıkıştırılmış .npz dosyası olarak kaydeder.
+        """
+        # 1) CuPy → NumPy
+        cpu_params = { k: cp.asnumpy(v) for k, v in parameters.items() }
+        # 2) sıkıştırılmış NPZ dosyası olarak kaydet
+        np.savez_compressed(f"best.npz", **cpu_params)
+        print(f"Model parameters saved to best.npz")
+
+    def load_model(self, pth):
+        """
+        .npz dosyasını yükler ve içindekileri CuPy dizilerine dönüştürür.
+        """
+        # 1) NPZ’yi oku (NumPy NPZ objesi döner)
+        npz = np.load(pth)
+        # 2) her bir parametreyi CuPy’ye al
+        self.parameters = {
+            k: cp.asarray(npz[k], dtype=cp.float32)
+            for k in npz.files
+        }
+
+        # (Opsiyonel) Debug için tipleri kontrol edin
+        for k, v in self.parameters.items():
+            print(f"[DEBUG load_model] {k}: {type(v)}, shape={v.shape}")
+        
+
+
+    def sliding_window(self,image, window_size=(196, 196), step_size=32):
+
+        window_width = int(window_size[0]) if isinstance(window_size[0], (int, float)) else int(window_size[0].item())
+        window_height = int(window_size[1]) if isinstance(window_size[1], (int, float)) else int(window_size[1].item())
+        
+        for x in range(0, image.shape[1] - window_width, step_size):
+            for y in range(0, image.shape[0] - window_height, step_size):
+                yield (x, y, image[y:y + window_height, x:x + window_width])
+
+
+
+
+    def object_detection_on_video(self, video_pth,
+                              window_size=(164,164),
+                              step_size=25,
+                              detect_threshold=0.5):
+        cap = cv2.VideoCapture(video_pth)
+
+        # sliding_window fonksiyonu da parametre alacak şekilde değişmeli:
+        # def sliding_window(self, image, window_size, step_size):
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+
+            # kareyi 640px genişlik yap, orantıyı koru
+            h, w = frame.shape[:2]
+            new_w = 640
+            new_h = int(h * new_w / w)
+            frame = cv2.resize(frame, (new_w, new_h))
+
+            scores = []
+            boxes  = []
+            win_w, win_h = window_size
+
+            # 1) Kaydırmalı pencere
+            for x, y, window in self.sliding_window(frame, window_size, step_size):
+                # ağın istediği input boyutuna küçült, görüntüyü griye çevir, flatten & normalize
+                small = cv2.resize(window, (64,64))
+                gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                flat  = gray.flatten().astype(np.float32) / 255.0
+                X     = cp.asarray(flat).reshape(-1,1)
+
+                # tahmin & thresh kontrolü
+                score = float(self.predict_no_threshold(X))
+                if score < detect_threshold:
+                    continue
+
+                
+                scores.append(score)
+                
+                boxes.append((x, y, x + win_w, y + win_h))
+
+            # 5) NMS
+            selected = self.non_max_suppression(boxes, scores)
+
+            # 6) çizim
+            for idx in selected:
+                x1, y1, x2, y2 = boxes[idx]
+                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+
+            cv2.imshow('Video', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+    def intersection_over_union(self,box1, box2):
+        # kesişim kutusunun koordinatlarını hesapla
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+        
+
+        inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
+        
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        
+        union_area = box1_area + box2_area - inter_area
+        
+        # iou değerini döndürür
+        return inter_area / union_area if union_area != 0 else 0
+
+    import cupy as cp
+
+    def non_max_suppression(self, boxes, scores, threshold=0.3):
+        """
+        boxes: (x1,y1,x2,y2)
+        """
+        
+        scores_cp = cp.asarray(scores, dtype=cp.float32)
+        # azalan sırada indeksleri al
+        indices = scores_cp.argsort()[::-1]  # cupy.ndarray
+
+        selected_boxes = []
+       
+        while len(indices) > 0:
+           
+            current = int(indices[0])
+            selected_boxes.append(current)
+
+            remaining = []
+            for idx in indices[1:]:
+                idx = int(idx)
+                if self.intersection_over_union(boxes[current], boxes[idx]) < threshold:
+                    remaining.append(idx)
+            # kalanları tekrar cupy.ndarray’e çevir
+            if remaining:
+                indices = cp.asarray(remaining, dtype=cp.int32)
+            else:
+                break
+
+        return selected_boxes
