@@ -2,3 +2,6 @@
 /vehicles
 /venv310
 *.mp4
+/__pycache__
+*.pyc
+*.pyc

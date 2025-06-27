@@ -8,13 +8,16 @@ class dnn_model:
 
     def __init__(self,layer_dims,lr=10e-4,lambd=0.01):
         
-        self.lr = lr
-        self.layer_dims = layer_dims
+        self.lr = lr # learning rate 
+        self.layer_dims = layer_dims #katman boyutları
         self.parameters = self.init_parameters(layer_dims)
-        self.LOG_EPSILON = 10e-10
-        self.lambd = lambd
+        self.LOG_EPSILON = 10e-10 # loss fonksiyonunun içi 0 olmasın diye kırpma işlemi için gereken çok küçük değer
+        self.lambd = lambd # L2 regularizasyon katsayısı
+
     def init_parameters(self,layer_dims):
-        
+        """
+        Parametrelerin HE başlatması
+        """
         parameters = {} 
         L = len(layer_dims)
 
@@ -84,7 +87,7 @@ class dnn_model:
         AL = cp.clip(AL,self.LOG_EPSILON,1-self.LOG_EPSILON)# 0 logaritma olmasın diye clip yapıyoruz
         cross_entropy = -cp.mean(Y * cp.log(AL) + (1 - Y) * cp.log(1 - AL))
 
-        if self.lambd > 0:
+        if self.lambd > 0: # L2 regularizasyonu eklenmişse loss'a L2 kısmı eklenir.
             L2_sum = sum(cp.sum(cp.square(self.parameters['W'+str(l)])) for l in range(1, len(self.layer_dims)))
             L2_term = (self.lambd / (2 * Y.shape[1])) * L2_sum
             loss = cross_entropy + L2_term
@@ -95,6 +98,7 @@ class dnn_model:
 
         return loss
     
+    #Aktivasyon fonksiyonlarının türevleri
     def sigmoid_derivative(self,Z):
         A,_ = self.sigmoid(Z)
 
@@ -155,13 +159,14 @@ class dnn_model:
 
         return grads
     
+    #Parametrelerin güncellenmesi
     def update_parameters(self,grads):
         L = len(self.parameters)//2
         for l in range(1,L+1):
             self.parameters['W'+str(l)] = self.parameters['W'+str(l)] - self.lr * grads['dW'+str(l)]
             self.parameters['b'+str(l)] = self.parameters['b'+str(l)] - self.lr * grads['db'+str(l)]
 
-
+    # mini-batchleri organize eden fonksiyon
     def get_mini_batches(self,X,Y,batch_size = 32):
         mini_batches = []
 
@@ -239,19 +244,14 @@ class dnn_model:
         return (A > threshold)
     
     def predict_no_threshold(self,X):
+        #NMS algoritması için gereken eşik değersiz prediction fonksiyonu
         A,_ = self.forward_prop(X)
         return A
     
-    def save_model(self, parameters):
-        # Cupy -> NumPy
-        cpu_params = { k: cp.asnumpy(v) for k, v in parameters.items() }
-        with open('parameters_best.pickle', 'wb') as handle:
-            pickle.dump(cpu_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
     def save_model(self,parameters):
         """
-        Parametreleri önce CPU’ya (NumPy) çevirir,
-        sonra sıkıştırılmış .npz dosyası olarak kaydeder.
+        parametreleri ilk önce cupy'dan numpy'a çevirir ardından
+        npz dosyası olarak kaydeder.
         """
         # 1) CuPy → NumPy
         cpu_params = { k: cp.asnumpy(v) for k, v in parameters.items() }
@@ -263,17 +263,14 @@ class dnn_model:
         """
         .npz dosyasını yükler ve içindekileri CuPy dizilerine dönüştürür.
         """
-        # 1) NPZ’yi oku (NumPy NPZ objesi döner)
+        # NPZ’yi oku 
         npz = np.load(pth)
-        # 2) her bir parametreyi CuPy’ye al
+        # her bir parametreyi CuPy’ye al
         self.parameters = {
             k: cp.asarray(npz[k], dtype=cp.float32)
             for k in npz.files
         }
 
-        # (Opsiyonel) Debug için tipleri kontrol edin
-        for k, v in self.parameters.items():
-            print(f"[DEBUG load_model] {k}: {type(v)}, shape={v.shape}")
         
 
 
